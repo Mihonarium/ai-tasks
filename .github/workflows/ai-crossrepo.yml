@@ -1,0 +1,174 @@
+name: AI → cross-repo PR
+
+on:
+  issues:
+    types: [opened, edited]
+
+jobs:
+  auto_pr:
+    # run only when the issue author is the repo owner
+    if: github.event.issue.user.login == github.repository_owner
+    runs-on: ubuntu-latest
+
+    # we bring our own tokens, so leave the default one read-only
+    permissions: {}
+
+    env:
+      # ====== API keys ========================================================
+      OPENAI_API_KEY:      ${{ secrets.OPENAI_KEY }}         # for Codex
+      ANTHROPIC_API_KEY:   ${{ secrets.ANTHROPIC_KEY }}      # for Claude Code
+      GH_TOKEN:            ${{ secrets.CROSS_REPO_TOKEN }}   # PAT / App token
+
+      # ====== handy vars from the issue payload =================================
+      ISSUE_BODY:  ${{ github.event.issue.body }}
+      ISSUE_TITLE: ${{ github.event.issue.title }}
+      ISSUE_NUM:   ${{ github.event.issue.number }}
+
+    steps:
+    # -----------------------------------------------------------------------
+    # 1.  Parse front–matter:
+    #     repo:   owner/target-repo
+    #     model:  codex | claude   (default codex)
+    #     claude_model: opus | sonnet  (optional, for claude only)
+    #     ---     <instructions>
+    # -----------------------------------------------------------------------
+    - name: Parse front-matter
+      id: parse
+      shell: bash
+      run: |
+        repo=$(echo "$ISSUE_BODY" | sed -n 's/^repo: //p' | head -1)
+        model=$(echo "$ISSUE_BODY" | sed -n 's/^model: //p' | head -1)
+        claude_model=$(echo "$ISSUE_BODY" | sed -n 's/^claude_model: //p' | head -1)
+        if [ -z "$model" ]; then model="codex"; fi
+
+        echo "repo=$repo"   >>"$GITHUB_OUTPUT"
+        echo "model=$model" >>"$GITHUB_OUTPUT"
+        echo "claude_model=$claude_model" >>"$GITHUB_OUTPUT"
+
+        instructions=$(echo "$ISSUE_BODY" | sed '1,/^---$/d')
+        echo "instructions<<EOF" >>"$GITHUB_OUTPUT"
+        echo "$instructions"     >>"$GITHUB_OUTPUT"
+        echo "EOF"               >>"$GITHUB_OUTPUT"
+
+    # -----------------------------------------------------------------------
+    # 2.  Check out the *target* repository side-by-side
+    # -----------------------------------------------------------------------
+    - uses: actions/checkout@v4
+      with:
+        repository: ${{ steps.parse.outputs.repo }}
+        token:      ${{ env.GH_TOKEN }}
+        path:       edit
+
+    # -----------------------------------------------------------------------
+    # 3.  Tooling — Node 22 + whichever CLI the issue asks for
+    # -----------------------------------------------------------------------
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 22.x          # Codex needs ≥22
+
+    # Codex CLI
+    - name: Install Codex
+      if: steps.parse.outputs.model == 'codex'
+      run: npm install -g @openai/codex
+
+    # Claude Code CLI
+    - name: Install Claude Code
+      if: steps.parse.outputs.model == 'claude'
+      run: npm install -g @anthropic-ai/claude-code
+
+    # -----------------------------------------------------------------------
+    # 4.  Run the selected agent
+    # -----------------------------------------------------------------------
+    - name: Run AI agent
+      id: ai_agent
+      working-directory: edit
+      shell: bash
+      run: |
+        OUTPUT_FILE="/tmp/ai_output.txt"
+        if [ "${{ steps.parse.outputs.model }}" = "claude" ]; then
+          # one-shot mode (plain prompt) – Claude Code reads ANTHROPIC_API_KEY
+          if [ -n "${{ steps.parse.outputs.claude_model }}" ]; then
+            claude --allowedTools "Bash,Read,WebFetch,Edit,Grep" --model "${{ steps.parse.outputs.claude_model }}" -p "${{ steps.parse.outputs.instructions }}" 2>&1 | tee "$OUTPUT_FILE"
+          else
+            claude --allowedTools "Bash,Read,WebFetch,Edit,Grep" -p "${{ steps.parse.outputs.instructions }}" 2>&1 | tee "$OUTPUT_FILE"
+          fi
+        else
+          codex -a auto-edit --quiet "${{ steps.parse.outputs.instructions }}" 2>&1 | tee "$OUTPUT_FILE"
+        fi
+        
+        # Store output for later use
+        echo "output<<EOF" >> "$GITHUB_OUTPUT"
+        cat "$OUTPUT_FILE" >> "$GITHUB_OUTPUT"
+        echo "EOF" >> "$GITHUB_OUTPUT"
+
+    # -----------------------------------------------------------------------
+    # 5.  Commit & push only when there is *any* change (tracked or not)
+    # -----------------------------------------------------------------------
+    - name: Commit & push
+      id: commit
+      working-directory: edit
+      shell: bash
+      run: |
+        if [[ -n "$(git status --porcelain)" ]]; then
+          git config user.name  "auto-pr-bot"
+          git config user.email "auto-pr-bot@users.noreply.github.com"
+
+          BRANCH="auto-pr/issue-${ISSUE_NUM}"
+          git switch -c "$BRANCH"
+
+          git add -A
+          git commit -m "auto-pr: ${ISSUE_TITLE} (#${ISSUE_NUM})"
+          git push -u origin "$BRANCH"
+
+          echo "created=yes"  >>"$GITHUB_OUTPUT"
+          echo "branch=$BRANCH" >>"$GITHUB_OUTPUT"
+        else
+          echo "created=no"   >>"$GITHUB_OUTPUT"
+        fi
+
+    # -----------------------------------------------------------------------
+    # 6.  Open PR only when we actually created a branch
+    # -----------------------------------------------------------------------
+    - name: Open PR
+      id: pr
+      if: steps.commit.outputs.created == 'yes'
+      working-directory: edit
+      run: |
+        DEFAULT_BRANCH=$(gh repo view --json defaultBranchRef --jq '.defaultBranchRef.name')
+        PR_URL=$(gh pr create           --title "Auto-PR: ${ISSUE_TITLE}"           --body  "Auto-generated from a private AI agent task #${ISSUE_NUM}"           --head  "${{ steps.commit.outputs.branch }}"           --base  "$DEFAULT_BRANCH")
+        echo "url=$PR_URL" >> "$GITHUB_OUTPUT"
+
+    # -----------------------------------------------------------------------
+    # 7.  Post comment on the original issue with AI output and PR link
+    # -----------------------------------------------------------------------
+    - name: Comment on issue
+      shell: bash
+      run: |
+        # Prepare comment body
+        COMMENT_BODY="## AI Agent Output
+
+        **Model:** ${{ steps.parse.outputs.model }}${{ steps.parse.outputs.claude_model && format(' ({0})', steps.parse.outputs.claude_model) || '' }}
+        **Target Repository:** ${{ steps.parse.outputs.repo }}
+
+        <details>
+        <summary>AI Agent Response</summary>
+
+        \`\`\`
+        ${{ steps.ai_agent.outputs.output }}
+        \`\`\`
+
+        </details>"
+
+        # Add PR link if a PR was created
+        if [ "${{ steps.commit.outputs.created }}" = "yes" ]; then
+          COMMENT_BODY="${COMMENT_BODY}
+
+        **Pull Request Created:** ${{ steps.pr.outputs.url }}"
+        else
+          COMMENT_BODY="${COMMENT_BODY}
+
+        **Status:** No changes were made by the AI agent."
+        fi
+
+        # Post comment to the original issue
+        gh api repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments           --method POST           --field body="$COMMENT_BODY"
